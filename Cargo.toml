@@ -1,0 +1,27 @@
+[package]
+name = "secure_farmer_proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+pingora = { version = "0.7", features = ["proxy"] }
+async-trait = "0.1"
+
+# The high-performance regex engine
+hyperscan = "0.3" 
+
+# For async runtime and utilities
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0" # Added for JSON manipulation
+
+# For normalization (Layer 1's main job)
+percent-encoding = "2.3"
+html-escape = "0.2"
+reqwest = { version = "0.12", features = ["json"] }
+bytes = "1.11.1"
+
+[build-dependencies]
+vcpkg = "0.2"

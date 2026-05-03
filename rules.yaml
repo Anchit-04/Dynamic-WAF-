@@ -1,0 +1,52 @@
+signatures:
+  # --- SQL Injection (SQLi) ---
+  - id: 1001
+    name: "SQLi - Union-based Attack"
+    pattern: "(?i)union.*select"
+    severity: "Critical"
+    category: "Injection"
+
+  - id: 1002
+    name: "SQLi - Boolean-based/Sleep"
+    pattern: "(?i)waitfor delay|sleep\\(|benchmark\\("
+    severity: "Critical"
+    category: "Injection"
+
+  # --- Cross-Site Scripting (XSS) ---
+  - id: 2001
+    name: "XSS - Script Tag Injection"
+    pattern: "(?i)<script.*?>.*?</script>"
+    severity: "High"
+    category: "XSS"
+
+  - id: 2002
+    name: "XSS - Event Handler (onerror/onload)"
+    pattern: "(?i)on(error|load|click|mouseover)\\s*="
+    severity: "High"
+    category: "XSS"
+
+  # --- Path Traversal & LFI ---
+  - id: 3001
+    name: "Path Traversal - Sensitive Linux Files"
+    pattern: "(?i)/etc/(passwd|shadow|group|hosts)"
+    severity: "Critical"
+    category: "Traversal"
+
+  - id: 3002
+    name: "Path Traversal - Dot-Dot-Slash"
+    pattern: "(?i)(\\.\\./|\\.\\.\\\\)"
+    severity: "Medium"
+    category: "Traversal"
+
+  # --- Remote Code Execution (RCE) ---
+  - id: 4001
+    name: "RCE - Shell Commands"
+    pattern: "(?i)(bin/bash|bin/sh|cmd\\.exe|powershell)"
+    severity: "Critical"
+    category: "RCE"
+
+  - id: 4002
+    name: "RCE - Log4Shell Attempt"
+    pattern: "\\$\\{jndi:(ldap|rmi|dns):"
+    severity: "Critical"
+    category: "RCE"

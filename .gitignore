@@ -1,0 +1,13 @@
+target/
+**/*.rs.bk
+# Python Virtual Environments
+
+venv/
+brain/venv/
+.env
+
+# Large AI Models and Weights
+*.safetensors
+*.bin
+*.pt
+*.pth
