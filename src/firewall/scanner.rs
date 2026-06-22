@@ -35,3 +35,46 @@ impl Scanner {
             .map(|idx| self.rule_id_map[idx])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sqli_detection() {
+        let scanner = Scanner::new("rules.yaml");
+        let result = scanner.matches("union select * from users");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 1001);
+    }
+
+    #[test]
+    fn test_clean_pass() {
+        let scanner = Scanner::new("rules.yaml");
+        assert!(scanner.matches("hello world this is clean").is_none());
+    }
+
+    #[test]
+    fn test_xss_detection() {
+        let scanner = Scanner::new("rules.yaml");
+        let result = scanner.matches("<script>alert('xss')</script>");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 2001);
+    }
+
+    #[test]
+    fn test_path_traversal() {
+        let scanner = Scanner::new("rules.yaml");
+        let result = scanner.matches("/etc/passwd");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 3001);
+    }
+
+    #[test]
+    fn test_rce_detection() {
+        let scanner = Scanner::new("rules.yaml");
+        let result = scanner.matches("bin/bash -c 'exploit'");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 4001);
+    }
+}

@@ -1,13 +1,15 @@
 use async_trait::async_trait;
+use log::{info, warn};
 use pingora::prelude::*;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use bytes::Bytes;
 
 mod firewall;
-use firewall::normalize::RequestNormalizer;
-use firewall::scanner::Scanner;
 use firewall::brain_client::BrainClient;
+use firewall::normalize::RequestNormalizer;
+use firewall::ratelimit::RateLimiter;
+use firewall::scanner::Scanner;
 
 const MAX_BODY_SIZE: usize = 10 * 1024;
 
@@ -19,6 +21,8 @@ struct ProxyConfig {
     listen_addr: String,
     brain_url: String,
     rules_path: String,
+    rate_limit_requests: usize,
+    rate_limit_window: u64,
 }
 
 impl ProxyConfig {
@@ -38,6 +42,14 @@ impl ProxyConfig {
             brain_url: std::env::var("BRAIN_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:5000/analyze".into()),
             rules_path: std::env::var("RULES_PATH").unwrap_or_else(|_| "rules.yaml".into()),
+            rate_limit_requests: std::env::var("RATE_LIMIT_REQUESTS")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(100),
+            rate_limit_window: std::env::var("RATE_LIMIT_WINDOW")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(60),
         }
     }
 }
@@ -49,6 +61,7 @@ pub struct WafContext {
 pub struct WafProxy {
     pub scanner: Arc<Mutex<Scanner>>,
     pub brain: Arc<BrainClient>,
+    pub rate_limiter: RateLimiter,
     config: ProxyConfig,
 }
 
@@ -63,13 +76,28 @@ impl ProxyHttp for WafProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut WafContext) -> Result<bool, Box<Error>> {
-        let scanner = self.scanner.lock().await;
+        let client_ip = session
+            .get_header("X-Forwarded-For")
+            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+            .unwrap_or_else(|| {
+                session
+                    .client_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default()
+            });
 
+        if !self.rate_limiter.check(&client_ip) {
+            warn!("rate_limit ip={}", client_ip);
+            session.respond_error(429).await?;
+            return Ok(true);
+        }
+
+        let scanner = self.scanner.lock().await;
         let raw_uri = session.req_header().uri.to_string();
         let clean_uri = RequestNormalizer::normalize(&raw_uri);
 
         if let Some(rule_id) = scanner.matches(&clean_uri) {
-            println!("[BLOCK] Layer 1 URI | Rule ID: {} | Payload: {}", rule_id, clean_uri);
+            info!("block layer=1 type=uri rule={} ip={} payload={}", rule_id, client_ip, clean_uri);
             session.respond_error(403).await?;
             return Ok(true);
         }
@@ -77,7 +105,7 @@ impl ProxyHttp for WafProxy {
         if let Some(ua) = session.get_header("User-Agent") {
             let clean_ua = RequestNormalizer::normalize(&ua.to_str().unwrap_or_default());
             if let Some(rule_id) = scanner.matches(&clean_ua) {
-                println!("[BLOCK] Layer 1 Header | Rule ID: {} | Payload: {}", rule_id, clean_ua);
+                info!("block layer=1 type=header rule={} ip={} payload={}", rule_id, client_ip, clean_ua);
                 session.respond_error(403).await?;
                 return Ok(true);
             }
@@ -86,12 +114,12 @@ impl ProxyHttp for WafProxy {
         drop(scanner);
 
         if self.brain.analyze(&clean_uri).await {
-            println!("[BLOCK] Layer 2 BRAIN | Flagged URI: {}", clean_uri);
+            info!("block layer=2 type=uri ip={} payload={}", client_ip, clean_uri);
             session.respond_error(403).await?;
             return Ok(true);
         }
 
-        println!("[PASS] All layers cleared URI: {}", clean_uri);
+        info!("pass uri={} ip={}", clean_uri, client_ip);
         Ok(false)
     }
 
@@ -105,26 +133,23 @@ impl ProxyHttp for WafProxy {
         if let Some(chunk) = body {
             let chunk_str = String::from_utf8_lossy(chunk);
 
-            // Layer 1 fast regex scan on each body chunk
             let scanner = self.scanner.lock().await;
             let clean_chunk = RequestNormalizer::normalize(&chunk_str);
             if let Some(rule_id) = scanner.matches(&clean_chunk) {
-                println!("[BLOCK] Layer 1 Body | Rule ID: {} | Payload: {}", rule_id, clean_chunk);
+                info!("block layer=1 type=body rule={} payload={}", rule_id, clean_chunk);
                 return Err(Error::new(HTTPStatus(403)));
             }
             drop(scanner);
 
-            // Accumulate full body for Layer 2 (bounded to prevent OOM)
             if ctx.request_body.len() < MAX_BODY_SIZE {
                 ctx.request_body.push_str(&chunk_str);
             }
         }
 
-        // Layer 2 brain analysis on the complete body
         if end_of_stream && !ctx.request_body.is_empty() {
             let clean_body = RequestNormalizer::normalize(&ctx.request_body);
             if self.brain.analyze(&clean_body).await {
-                println!("[BLOCK] Layer 2 BRAIN Body | Flagged Content: {}", clean_body);
+                info!("block layer=2 type=body payload={}", clean_body);
                 return Err(Error::new(HTTPStatus(403)));
             }
         }
@@ -140,27 +165,31 @@ impl ProxyHttp for WafProxy {
 }
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
     let config = ProxyConfig::from_env();
-
     let listen_addr = config.listen_addr.clone();
+
+    let upstream_host = config.upstream_host.clone();
+    let upstream_port = config.upstream_port;
+    let upstream_tls = config.upstream_tls;
 
     let waf_proxy = WafProxy {
         scanner: Arc::new(Mutex::new(Scanner::new(&config.rules_path))),
         brain: Arc::new(BrainClient::new(&config.brain_url)),
+        rate_limiter: RateLimiter::new(config.rate_limit_requests, config.rate_limit_window),
         config,
     };
 
     let mut proxy_service = http_proxy_service(&server.configuration, waf_proxy);
     proxy_service.add_tcp(&listen_addr);
 
-    println!("--------------------------------------------------");
-    println!("  Production WAF is live on http://{}", listen_addr);
-    println!("  Layer 1: Normalization + Regex Active");
-    println!("  Layer 2: Transformer Brain Bridge Active");
-    println!("--------------------------------------------------");
+    info!("started listen={} upstream={}:{} tls={}", listen_addr, upstream_host, upstream_port, upstream_tls);
 
     server.add_service(proxy_service);
     server.run_forever();
