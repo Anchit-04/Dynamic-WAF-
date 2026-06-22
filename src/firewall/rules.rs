@@ -7,6 +7,7 @@ pub struct Rule {
     pub name: String,
     pub pattern: String,
     pub severity: String,
+    pub category: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

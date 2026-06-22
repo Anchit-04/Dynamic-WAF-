@@ -9,6 +9,7 @@ struct BrainRequest {
 
 #[derive(Deserialize)]
 struct BrainResponse {
+    #[allow(dead_code)]
     score: f32,
     action: String,
 }

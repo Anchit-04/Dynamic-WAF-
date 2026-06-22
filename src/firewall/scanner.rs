@@ -1,43 +1,37 @@
-use hyperscan::prelude::*;
+use regex::RegexSet;
 use crate::firewall::rules::RuleSet;
 
 pub struct Scanner {
-    pub db: BlockDatabase,
-    pub scratch: Scratch,
-    pub rules: RuleSet, 
+    pub regex_set: RegexSet,
+    pub rule_id_map: Vec<u32>,
+    pub rules: RuleSet,
 }
 
 impl Scanner {
     pub fn new(rules_path: &str) -> Self {
         let rule_set = RuleSet::load_from_file(rules_path);
-        
-        // Patterns is hyperscan's own Vec wrapper that implements DatabaseBuilder
-        let patterns: Patterns = rule_set.signatures
+
+        let patterns: Vec<&str> = rule_set.signatures
             .iter()
-            .map(|r| {
-                let mut p = pattern! { &r.pattern; CASELESS | DOTALL };
-                p.id = Some(r.id as usize);
-                p
-            })
+            .map(|r| r.pattern.as_str())
             .collect();
 
-        let db: BlockDatabase = patterns
-            .build()
-            .expect("Failed to compile Hyperscan database");
-            
-        let scratch = db.alloc_scratch().expect("Failed to allocate scratch space");
+        let regex_set = RegexSet::new(&patterns)
+            .expect("Failed to compile regex rules");
 
-        Scanner { db, scratch, rules: rule_set }
+        let rule_id_map: Vec<u32> = rule_set.signatures
+            .iter()
+            .map(|r| r.id)
+            .collect();
+
+        Scanner { regex_set, rule_id_map, rules: rule_set }
     }
 
-    pub fn matches(&mut self, input: &str) -> Option<u32> {
-        let mut matched_id: Option<u32> = None;
-        
-        let _ = self.db.scan(input, &self.scratch, |id, _from, _to, _flags| {
-            matched_id = Some(id as u32);
-            Matching::Terminate 
-        });
-        
-        matched_id
+    pub fn matches(&self, input: &str) -> Option<u32> {
+        self.regex_set
+            .matches(input)
+            .into_iter()
+            .next()
+            .map(|idx| self.rule_id_map[idx])
     }
 }

@@ -1,19 +1,49 @@
-#[macro_use]
-extern crate hyperscan;
 use async_trait::async_trait;
 use pingora::prelude::*;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use bytes::Bytes; // Fixed: Required for body processing
+use bytes::Bytes;
 
 mod firewall;
 use firewall::normalize::RequestNormalizer;
 use firewall::scanner::Scanner;
 use firewall::brain_client::BrainClient;
 
+struct ProxyConfig {
+    upstream_host: String,
+    upstream_port: u16,
+    upstream_tls: bool,
+    upstream_sni: String,
+    listen_addr: String,
+    brain_url: String,
+    rules_path: String,
+}
+
+impl ProxyConfig {
+    fn from_env() -> Self {
+        ProxyConfig {
+            upstream_host: std::env::var("UPSTREAM_HOST").unwrap_or_else(|_| "1.1.1.1".into()),
+            upstream_port: std::env::var("UPSTREAM_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(443),
+            upstream_tls: std::env::var("UPSTREAM_TLS")
+                .ok()
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(true),
+            upstream_sni: std::env::var("UPSTREAM_SNI").unwrap_or_else(|_| "one.one.one.one".into()),
+            listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".into()),
+            brain_url: std::env::var("BRAIN_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:5000/analyze".into()),
+            rules_path: std::env::var("RULES_PATH").unwrap_or_else(|_| "rules.yaml".into()),
+        }
+    }
+}
+
 pub struct WafProxy {
     pub scanner: Arc<Mutex<Scanner>>,
-    pub brain: Arc<BrainClient>, 
+    pub brain: Arc<BrainClient>,
+    config: ProxyConfig,
 }
 
 #[async_trait]
@@ -22,12 +52,12 @@ impl ProxyHttp for WafProxy {
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool, Box<Error>> {
-        let mut scanner = self.scanner.lock().await;
+        let scanner = self.scanner.lock().await;
 
         // --- LAYER 0: NORMALIZATION ---
         let raw_uri = session.req_header().uri.to_string();
         let clean_uri = RequestNormalizer::normalize(&raw_uri);
-        
+
         // --- LAYER 1: FAST SCAN (URI) ---
         if let Some(rule_id) = scanner.matches(&clean_uri) {
             println!("[BLOCK] Layer 1 URI | Rule ID: {} | Payload: {}", rule_id, clean_uri);
@@ -45,7 +75,6 @@ impl ProxyHttp for WafProxy {
             }
         }
 
-        // Drop the lock before the network call to the Brain
         drop(scanner);
 
         // --- LAYER 2: TRANSFORMER BRAIN ---
@@ -61,36 +90,39 @@ impl ProxyHttp for WafProxy {
 
     async fn request_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<(), Box<Error>> {
         if let Some(chunk) = body {
             let clean_body = RequestNormalizer::normalize(&String::from_utf8_lossy(chunk));
-            
+
             // Layer 1 Check on body chunk
             {
-                let mut scanner = self.scanner.lock().await;
+                let scanner = self.scanner.lock().await;
                 if let Some(rule_id) = scanner.matches(&clean_body) {
                     println!("[BLOCK] Layer 1 Body | Rule ID: {} | Payload: {}", rule_id, clean_body);
-                    // In Pingora 0.7, we use Error::new(HTTPStatus(403))
-                    return Err(Error::new(HTTPStatus(403)));
+                    *body = None;
+                    session.respond_error(403).await?;
+                    return Ok(());
                 }
             }
 
-            // Layer 2 Body Check (Small chunks only)
+            // Layer 2 Body Check
             if clean_body.len() < 1000 && self.brain.analyze(&clean_body).await {
                  println!("[BLOCK] Layer 2 BRAIN Body | Flagged Content: {}", clean_body);
-                 return Err(Error::new(HTTPStatus(403)));
+                 *body = None;
+                 session.respond_error(403).await?;
+                 return Ok(());
             }
         }
         Ok(())
     }
 
     async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<Box<HttpPeer>, Box<Error>> {
-        // Pointing to a public DNS for testing
-        let peer = Box::new(HttpPeer::new("1.1.1.1:443", true, "one.one.one.one".to_string()));
+        let addr = format!("{}:{}", self.config.upstream_host, self.config.upstream_port);
+        let peer = Box::new(HttpPeer::new(&addr, self.config.upstream_tls, self.config.upstream_sni.clone()));
         Ok(peer)
     }
 }
@@ -99,20 +131,23 @@ fn main() {
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
-    let brain_api_url = "http://127.0.0.1:5000/analyze";
+    let config = ProxyConfig::from_env();
+
+    let listen_addr = config.listen_addr.clone();
 
     let waf_proxy = WafProxy {
-        scanner: Arc::new(Mutex::new(Scanner::new("rules.yaml"))),
-        brain: Arc::new(BrainClient::new(brain_api_url)),
+        scanner: Arc::new(Mutex::new(Scanner::new(&config.rules_path))),
+        brain: Arc::new(BrainClient::new(&config.brain_url)),
+        config,
     };
 
     let mut proxy_service = http_proxy_service(&server.configuration, waf_proxy);
-    proxy_service.add_tcp("0.0.0.0:8000"); 
+    proxy_service.add_tcp(&listen_addr);
 
     println!("--------------------------------------------------");
-    println!("🚀 Production WAF is live on http://localhost:8000");
-    println!("🛡️  Layer 1: Normalization + Hyperscan Active");
-    println!("🧠  Layer 2: Transformer Brain Bridge Active");
+    println!("  Production WAF is live on http://{}", listen_addr);
+    println!("  Layer 1: Normalization + Regex Active");
+    println!("  Layer 2: Transformer Brain Bridge Active");
     println!("--------------------------------------------------");
 
     server.add_service(proxy_service);
