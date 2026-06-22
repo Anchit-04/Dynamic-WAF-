@@ -9,6 +9,8 @@ use firewall::normalize::RequestNormalizer;
 use firewall::scanner::Scanner;
 use firewall::brain_client::BrainClient;
 
+const MAX_BODY_SIZE: usize = 10 * 1024;
+
 struct ProxyConfig {
     upstream_host: String,
     upstream_port: u16,
@@ -40,6 +42,10 @@ impl ProxyConfig {
     }
 }
 
+pub struct WafContext {
+    request_body: String,
+}
+
 pub struct WafProxy {
     pub scanner: Arc<Mutex<Scanner>>,
     pub brain: Arc<BrainClient>,
@@ -48,24 +54,26 @@ pub struct WafProxy {
 
 #[async_trait]
 impl ProxyHttp for WafProxy {
-    type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    type CTX = WafContext;
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool, Box<Error>> {
+    fn new_ctx(&self) -> WafContext {
+        WafContext {
+            request_body: String::new(),
+        }
+    }
+
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut WafContext) -> Result<bool, Box<Error>> {
         let scanner = self.scanner.lock().await;
 
-        // --- LAYER 0: NORMALIZATION ---
         let raw_uri = session.req_header().uri.to_string();
         let clean_uri = RequestNormalizer::normalize(&raw_uri);
 
-        // --- LAYER 1: FAST SCAN (URI) ---
         if let Some(rule_id) = scanner.matches(&clean_uri) {
             println!("[BLOCK] Layer 1 URI | Rule ID: {} | Payload: {}", rule_id, clean_uri);
             session.respond_error(403).await?;
             return Ok(true);
         }
 
-        // --- LAYER 1: FAST SCAN (Headers) ---
         if let Some(ua) = session.get_header("User-Agent") {
             let clean_ua = RequestNormalizer::normalize(&ua.to_str().unwrap_or_default());
             if let Some(rule_id) = scanner.matches(&clean_ua) {
@@ -77,7 +85,6 @@ impl ProxyHttp for WafProxy {
 
         drop(scanner);
 
-        // --- LAYER 2: TRANSFORMER BRAIN ---
         if self.brain.analyze(&clean_uri).await {
             println!("[BLOCK] Layer 2 BRAIN | Flagged URI: {}", clean_uri);
             session.respond_error(403).await?;
@@ -90,37 +97,42 @@ impl ProxyHttp for WafProxy {
 
     async fn request_body_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
-        _ctx: &mut Self::CTX,
+        end_of_stream: bool,
+        ctx: &mut WafContext,
     ) -> Result<(), Box<Error>> {
         if let Some(chunk) = body {
-            let clean_body = RequestNormalizer::normalize(&String::from_utf8_lossy(chunk));
+            let chunk_str = String::from_utf8_lossy(chunk);
 
-            // Layer 1 Check on body chunk
-            {
-                let scanner = self.scanner.lock().await;
-                if let Some(rule_id) = scanner.matches(&clean_body) {
-                    println!("[BLOCK] Layer 1 Body | Rule ID: {} | Payload: {}", rule_id, clean_body);
-                    *body = None;
-                    session.respond_error(403).await?;
-                    return Ok(());
-                }
+            // Layer 1 fast regex scan on each body chunk
+            let scanner = self.scanner.lock().await;
+            let clean_chunk = RequestNormalizer::normalize(&chunk_str);
+            if let Some(rule_id) = scanner.matches(&clean_chunk) {
+                println!("[BLOCK] Layer 1 Body | Rule ID: {} | Payload: {}", rule_id, clean_chunk);
+                return Err(Error::new(HTTPStatus(403)));
             }
+            drop(scanner);
 
-            // Layer 2 Body Check
-            if clean_body.len() < 1000 && self.brain.analyze(&clean_body).await {
-                 println!("[BLOCK] Layer 2 BRAIN Body | Flagged Content: {}", clean_body);
-                 *body = None;
-                 session.respond_error(403).await?;
-                 return Ok(());
+            // Accumulate full body for Layer 2 (bounded to prevent OOM)
+            if ctx.request_body.len() < MAX_BODY_SIZE {
+                ctx.request_body.push_str(&chunk_str);
             }
         }
+
+        // Layer 2 brain analysis on the complete body
+        if end_of_stream && !ctx.request_body.is_empty() {
+            let clean_body = RequestNormalizer::normalize(&ctx.request_body);
+            if self.brain.analyze(&clean_body).await {
+                println!("[BLOCK] Layer 2 BRAIN Body | Flagged Content: {}", clean_body);
+                return Err(Error::new(HTTPStatus(403)));
+            }
+        }
+
         Ok(())
     }
 
-    async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<Box<HttpPeer>, Box<Error>> {
+    async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut WafContext) -> Result<Box<HttpPeer>, Box<Error>> {
         let addr = format!("{}:{}", self.config.upstream_host, self.config.upstream_port);
         let peer = Box::new(HttpPeer::new(&addr, self.config.upstream_tls, self.config.upstream_sni.clone()));
         Ok(peer)

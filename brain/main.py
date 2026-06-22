@@ -48,12 +48,12 @@ class BrainRequest(BaseModel):
 # --- Inference Route ---
 @app.post("/analyze")
 async def analyze_payload(request: BrainRequest):
-    # Tokenize the incoming payload
     inputs = tokenizer(
-        request.payload, 
-        return_tensors="pt", 
-        truncation=True, 
-        max_length=512
+        request.payload,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding=False,
     )
     
     # Run Inference
@@ -77,4 +77,5 @@ async def analyze_payload(request: BrainRequest):
 # --- Execution ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=5000)
+    port = int(os.environ.get("BRAIN_PORT", "5000"))
+    uvicorn.run(app, host="127.0.0.1", port=port)
