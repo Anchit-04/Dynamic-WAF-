@@ -41,6 +41,9 @@ except Exception as e:
     logger.info("CRITICAL: Make sure the 'production_waf_brain' folder exists next to main.py")
     raise e
 
+THRESHOLD = float(os.environ.get("BRAIN_THRESHOLD", "0.85"))
+logger.info(f"Decision threshold set to {THRESHOLD}")
+
 # --- API Data Structures ---
 class BrainRequest(BaseModel):
     payload: str
@@ -64,14 +67,14 @@ async def analyze_payload(request: BrainRequest):
     # malicious_score (Probability of class 1)
     malicious_score = probs[0][1].item()
     
-    # Decision Logic
-    decision = "block" if malicious_score > 0.85 else "pass"
+    decision = "block" if malicious_score > THRESHOLD else "pass"
     
     logger.info(f"Analyzed: '{request.payload[:30]}...' | Score: {malicious_score:.4f} | Action: {decision.upper()}")
     
     return {
         "score": malicious_score,
-        "action": decision
+        "action": decision,
+        "threshold": THRESHOLD,
     }
 
 # --- Execution ---

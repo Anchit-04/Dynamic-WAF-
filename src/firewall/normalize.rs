@@ -9,6 +9,7 @@ impl RequestNormalizer {
         let html_decoded = decode_html_entities(&url_decoded);
         html_decoded
             .to_lowercase()
+            .trim_matches('/')
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -49,6 +50,21 @@ mod tests {
     fn test_xss_encoding() {
         let result = RequestNormalizer::normalize("&lt;script&gt;alert(1)&lt;/script&gt;");
         assert_eq!(result, "<script>alert(1)</script>");
+    }
+
+    #[test]
+    fn test_strips_leading_slash() {
+        assert_eq!(RequestNormalizer::normalize("/hello"), "hello");
+    }
+
+    #[test]
+    fn test_strips_trailing_slash() {
+        assert_eq!(RequestNormalizer::normalize("admin/"), "admin");
+    }
+
+    #[test]
+    fn test_strips_both_slashes() {
+        assert_eq!(RequestNormalizer::normalize("/api/v1/users/"), "api/v1/users");
     }
 
     #[test]

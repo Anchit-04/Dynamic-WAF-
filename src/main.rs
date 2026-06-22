@@ -23,6 +23,7 @@ struct ProxyConfig {
     rules_path: String,
     rate_limit_requests: usize,
     rate_limit_window: u64,
+    allowlist_paths: Vec<String>,
 }
 
 impl ProxyConfig {
@@ -50,6 +51,12 @@ impl ProxyConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(60),
+            allowlist_paths: std::env::var("ALLOWLIST_PATHS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 }
@@ -113,13 +120,15 @@ impl ProxyHttp for WafProxy {
 
         drop(scanner);
 
-        if self.brain.analyze(&clean_uri).await {
+        let allowlisted = self.config.allowlist_paths.iter().any(|p| raw_uri.starts_with(p));
+        if !allowlisted && self.brain.analyze(&clean_uri).await {
             info!("block layer=2 type=uri ip={} payload={}", client_ip, clean_uri);
             session.respond_error(403).await?;
             return Ok(true);
         }
 
-        info!("pass uri={} ip={}", clean_uri, client_ip);
+        let status = if allowlisted { "pass_allowlisted" } else { "pass" };
+        info!("{} uri={} ip={}", status, clean_uri, client_ip);
         Ok(false)
     }
 

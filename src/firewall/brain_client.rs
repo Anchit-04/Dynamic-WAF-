@@ -12,6 +12,8 @@ struct BrainResponse {
     #[allow(dead_code)]
     score: f32,
     action: String,
+    #[allow(dead_code)]
+    threshold: f32,
 }
 
 pub struct BrainClient {
