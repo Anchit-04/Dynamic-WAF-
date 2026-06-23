@@ -1,0 +1,34 @@
+services:
+  brain:
+    build:
+      context: .
+      dockerfile: brain/Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - BRAIN_PORT=5000
+      - BRAIN_THRESHOLD=0.85
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/docs')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  proxy:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      brain:
+        condition: service_healthy
+    environment:
+      - UPSTREAM_HOST=1.1.1.1
+      - UPSTREAM_PORT=443
+      - UPSTREAM_TLS=true
+      - UPSTREAM_SNI=one.one.one.one
+      - BRAIN_URL=http://brain:5000/analyze
+      - RATE_LIMIT_REQUESTS=100
+      - RATE_LIMIT_WINDOW=60
+      - RUST_LOG=info
+      - ALLOWLIST_PATHS=
